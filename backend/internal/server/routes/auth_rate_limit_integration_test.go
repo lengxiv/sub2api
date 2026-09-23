@@ -16,6 +16,7 @@ import (
 	"github.com/redis/go-redis/v9"
 	"github.com/stretchr/testify/require"
 	tcredis "github.com/testcontainers/testcontainers-go/modules/redis"
+	tcnetwork "github.com/testcontainers/testcontainers-go/network"
 )
 
 const authRouteRedisImageTag = "redis:8.4-alpine"
@@ -48,7 +49,13 @@ func startAuthRouteRedis(t *testing.T, ctx context.Context) *redis.Client {
 	t.Helper()
 	ensureAuthRouteDockerAvailable(t)
 
-	redisContainer, err := tcredis.Run(ctx, authRouteRedisImageTag)
+	testNetwork, err := tcnetwork.New(ctx)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		_ = testNetwork.Remove(ctx)
+	})
+
+	redisContainer, err := tcredis.Run(ctx, authRouteRedisImageTag, tcnetwork.WithNetwork([]string{"redis"}, testNetwork))
 	require.NoError(t, err)
 	t.Cleanup(func() {
 		_ = redisContainer.Terminate(ctx)

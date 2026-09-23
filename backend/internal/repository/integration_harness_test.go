@@ -27,6 +27,7 @@ import (
 	redisclient "github.com/redis/go-redis/v9"
 	tcpostgres "github.com/testcontainers/testcontainers-go/modules/postgres"
 	tcredis "github.com/testcontainers/testcontainers-go/modules/redis"
+	tcnetwork "github.com/testcontainers/testcontainers-go/network"
 )
 
 const (
@@ -60,10 +61,17 @@ func TestMain(m *testing.M) {
 		os.Exit(0)
 	}
 
+	testNetwork, err := tcnetwork.New(ctx)
+	if err != nil {
+		log.Printf("failed to create test network: %v", err)
+		os.Exit(1)
+	}
+
 	postgresImage := selectDockerImage(ctx, postgresImageTag)
 	pgContainer, err := tcpostgres.Run(
 		ctx,
 		postgresImage,
+		tcnetwork.WithNetwork([]string{"postgres"}, testNetwork),
 		tcpostgres.WithDatabase("sub2api_test"),
 		tcpostgres.WithUsername("postgres"),
 		tcpostgres.WithPassword("postgres"),
@@ -71,33 +79,59 @@ func TestMain(m *testing.M) {
 	)
 	if err != nil {
 		log.Printf("failed to start postgres container: %v", err)
+		if pgContainer != nil {
+			_ = pgContainer.Terminate(ctx)
+		}
+		_ = testNetwork.Remove(ctx)
 		os.Exit(1)
 	}
-	defer func() { _ = pgContainer.Terminate(ctx) }()
 
 	redisContainer, err := tcredis.Run(
 		ctx,
 		redisImageTag,
+		tcnetwork.WithNetwork([]string{"redis"}, testNetwork),
 	)
 	if err != nil {
 		log.Printf("failed to start redis container: %v", err)
+		if redisContainer != nil {
+			_ = redisContainer.Terminate(ctx)
+		}
+		_ = pgContainer.Terminate(ctx)
+		_ = testNetwork.Remove(ctx)
 		os.Exit(1)
 	}
-	defer func() { _ = redisContainer.Terminate(ctx) }()
+
+	cleanup := func() {
+		if integrationEntClient != nil {
+			_ = integrationEntClient.Close()
+		}
+		if integrationRedis != nil {
+			_ = integrationRedis.Close()
+		}
+		if integrationDB != nil {
+			_ = integrationDB.Close()
+		}
+		_ = redisContainer.Terminate(ctx)
+		_ = pgContainer.Terminate(ctx)
+		_ = testNetwork.Remove(ctx)
+	}
 
 	dsn, err := pgContainer.ConnectionString(ctx, "sslmode=disable", "TimeZone=UTC")
 	if err != nil {
 		log.Printf("failed to get postgres dsn: %v", err)
+		cleanup()
 		os.Exit(1)
 	}
 
 	integrationDB, err = openSQLWithRetry(ctx, dsn, 30*time.Second)
 	if err != nil {
 		log.Printf("failed to open sql db: %v", err)
+		cleanup()
 		os.Exit(1)
 	}
 	if err := ApplyMigrations(ctx, integrationDB); err != nil {
 		log.Printf("failed to apply db migrations: %v", err)
+		cleanup()
 		os.Exit(1)
 	}
 
@@ -108,11 +142,13 @@ func TestMain(m *testing.M) {
 	redisHost, err := redisContainer.Host(ctx)
 	if err != nil {
 		log.Printf("failed to get redis host: %v", err)
+		cleanup()
 		os.Exit(1)
 	}
 	redisPort, err := redisContainer.MappedPort(ctx, "6379/tcp")
 	if err != nil {
 		log.Printf("failed to get redis port: %v", err)
+		cleanup()
 		os.Exit(1)
 	}
 
@@ -122,15 +158,13 @@ func TestMain(m *testing.M) {
 	})
 	if err := integrationRedis.Ping(ctx).Err(); err != nil {
 		log.Printf("failed to ping redis: %v", err)
+		cleanup()
 		os.Exit(1)
 	}
 
 	code := m.Run()
 
-	_ = integrationEntClient.Close()
-	_ = integrationRedis.Close()
-	_ = integrationDB.Close()
-
+	cleanup()
 	os.Exit(code)
 }
 
